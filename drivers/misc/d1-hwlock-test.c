@@ -25,15 +25,19 @@
 #include <linux/hwspinlock.h>
 #include <linux/init.h>
 #include <linux/io.h>
+#include <linux/jiffies.h>
 #include <linux/ktime.h>
 #include <linux/minmax.h>
 #include <linux/module.h>
 #include <linux/moduleparam.h>
+#include <linux/of.h>
+#include <linux/of_address.h>
+#include <linux/spinlock.h>
 
 #define SHARED_PHYS_DEFAULT	0x483ff000UL
 #define SHARED_SIZE		0x1000
 #define SHARED_MAGIC		0x5a5a1234
-#define SHARED_VERSION		1
+#define SHARED_VERSION		2
 
 #define TRIALS_DEFAULT		1000000
 
@@ -54,6 +58,8 @@ struct shared {
 	u32 dsp_done;
 	u32 linux_violations;
 	u32 dsp_ping;		/* DSP increments this while it polls */
+	u32 dsp_bench_req;	/* 1 = DSP runs its own lock benchmark */
+	u32 dsp_bench_done;	/* DSP sets this when that benchmark finished */
 };
 
 static unsigned long shared_phys = SHARED_PHYS_DEFAULT;
@@ -62,6 +68,7 @@ static unsigned int lock_id;
 static bool use_lock = true;
 static unsigned int dsp_timeout_ms = 30000;
 static bool skip_dsp;
+static unsigned int bench;
 
 module_param(shared_phys, ulong, 0444);
 module_param(trials, uint, 0444);
@@ -69,10 +76,12 @@ module_param(lock_id, uint, 0444);
 module_param(use_lock, bool, 0444);
 module_param(dsp_timeout_ms, uint, 0444);
 module_param(skip_dsp, bool, 0444);
+module_param(bench, uint, 0444);
 MODULE_PARM_DESC(trials, "iterations on the Linux side (default 1000000)");
 MODULE_PARM_DESC(lock_id, "hardware lock number to use (default 0)");
 MODULE_PARM_DESC(use_lock, "1 = take the lock, 0 = negative control");
 MODULE_PARM_DESC(skip_dsp, "run without a DSP partner");
+MODULE_PARM_DESC(bench, "0 = contention test, 1 = C906 take/free cost, 2 = 1 + DSP take/free cost, 3 = 2 + bare register cost, 4 = 3 + framework split");
 
 static void shared_reset(struct shared __iomem *sh, u32 target)
 {
@@ -85,6 +94,8 @@ static void shared_reset(struct shared __iomem *sh, u32 target)
 	writel(0, &sh->dsp_iters);
 	writel(0, &sh->dsp_done);
 	writel(0, &sh->linux_violations);
+	writel(0, &sh->dsp_bench_req);
+	writel(0, &sh->dsp_bench_done);
 	writel(target, &sh->target);
 	writel(SHARED_VERSION, &sh->version);
 	writel(SHARED_MAGIC, &sh->magic);
@@ -137,6 +148,359 @@ static int run_burst(struct shared __iomem *sh, struct hwspinlock *lk, u32 n)
 	return trips;
 }
 
+/*
+ * Benchmarks. These run with go == 0, so the DSP never touches the lock and
+ * what is measured is the primitive itself rather than waiting for the peer.
+ * The baseline uses a word in the same page that the DSP never touches, so it
+ * is not perturbed by the polling writeback of the shared cache line.
+ */
+#define BENCH_WORD_OFFSET	0x800
+
+static void __iomem *bench_word(struct shared __iomem *sh)
+{
+	return (void __iomem *)((char __iomem *)sh + BENCH_WORD_OFFSET);
+}
+
+static s64 bench_read(struct shared __iomem *sh, u32 n)
+{
+	void __iomem *w = bench_word(sh);
+	ktime_t t0 = ktime_get();
+	u32 i, sink = 0;
+
+	for (i = 0; i < n; i++)
+		sink += readl(w);
+
+	/* keep the loop from being optimised away */
+	if (sink == 0xdeadbeef)
+		writel(sink, w);
+
+	return ktime_to_ns(ktime_sub(ktime_get(), t0));
+}
+
+static s64 bench_write(struct shared __iomem *sh, u32 n)
+{
+	void __iomem *w = bench_word(sh);
+	ktime_t t0 = ktime_get();
+	u32 i;
+
+	for (i = 0; i < n; i++)
+		writel(0, w);
+
+	return ktime_to_ns(ktime_sub(ktime_get(), t0));
+}
+
+static s64 bench_take_free(struct hwspinlock *lk, u32 n)
+{
+	ktime_t t0 = ktime_get();
+	u32 i;
+
+	for (i = 0; i < n; i++) {
+		int ret = hwspin_lock_timeout(lk, msecs_to_jiffies(1000));
+
+		if (ret)
+			return ret;
+		hwspin_unlock(lk);
+	}
+
+	return ktime_to_ns(ktime_sub(ktime_get(), t0));
+}
+
+/*
+ * Take/free straight on the register: one readl() to take (the block returns 0
+ * on success), one writel(0) to release, as sun6i_hwspinlock_trylock()/unlock()
+ * do - but without the spinlock, the mb()s or the timeout bookkeeping. Splits
+ * the measured cost into "the register is slow" and "the framework is slow".
+ */
+static s64 bench_raw_take_free(void __iomem *lock_reg, u32 n)
+{
+	ktime_t t0 = ktime_get();
+	u32 i, missed = 0;
+
+	for (i = 0; i < n; i++) {
+		if (readl(lock_reg)) {
+			missed++;
+			continue;
+		}
+		writel(0, lock_reg);
+	}
+
+	if (missed)
+		pr_warn("sun6i-hwlock-test: raw bench: %u takes failed\n", missed);
+
+	return ktime_to_ns(ktime_sub(ktime_get(), t0));
+}
+
+/* Same, through the API's raw mode: adds the two mb() calls, nothing else. */
+static s64 bench_trylock_raw(struct hwspinlock *lk, u32 n)
+{
+	ktime_t t0 = ktime_get();
+	u32 i, missed = 0;
+
+	for (i = 0; i < n; i++) {
+		if (hwspin_trylock_raw(lk)) {
+			missed++;
+			continue;
+		}
+		hwspin_unlock_raw(lk);
+	}
+
+	if (missed)
+		pr_warn("sun6i-hwlock-test: trylock_raw bench: %u takes failed\n",
+			missed);
+
+	return ktime_to_ns(ktime_sub(ktime_get(), t0));
+}
+
+/* Same register loop, plus the two mb() the hwspinlock core issues. */
+static s64 bench_raw_take_free_mb(void __iomem *lock_reg, u32 n)
+{
+	ktime_t t0 = ktime_get();
+	u32 i;
+
+	for (i = 0; i < n; i++) {
+		if (readl(lock_reg))
+			continue;
+		mb();
+		writel(0, lock_reg);
+		mb();
+	}
+
+	return ktime_to_ns(ktime_sub(ktime_get(), t0));
+}
+
+/*
+ * CPU clock probe: eight dependent adds, one cycle apart on an in-order core,
+ * so ns/iteration * clock = 8. Turns every other number here into cycles and
+ * shows whether a cost is the code or just a slow core.
+ */
+#define DEP_ADDI(x, k) asm volatile("addi %0, %0, " #k : "+r"(x))
+
+static s64 bench_cpu_speed(u32 n)
+{
+	ktime_t t0 = ktime_get();
+	u64 x = 0;
+	u32 i;
+
+	for (i = 0; i < n; i++) {
+		DEP_ADDI(x, 1);
+		DEP_ADDI(x, 2);
+		DEP_ADDI(x, 3);
+		DEP_ADDI(x, 4);
+		DEP_ADDI(x, 5);
+		DEP_ADDI(x, 6);
+		DEP_ADDI(x, 7);
+		DEP_ADDI(x, 8);
+	}
+
+	if (x == 42)
+		pr_info("sun6i-hwlock-test: unreachable %llu\n", x);
+
+	return ktime_to_ns(ktime_sub(ktime_get(), t0));
+}
+
+static s64 bench_atomic_api(struct hwspinlock *lk, u32 n)
+{
+	ktime_t t0 = ktime_get();
+	u32 i;
+
+	for (i = 0; i < n; i++) {
+		if (hwspin_lock_timeout_in_atomic(lk, 1000))
+			break;
+		hwspin_unlock_in_atomic(lk);
+	}
+
+	return ktime_to_ns(ktime_sub(ktime_get(), t0));
+}
+
+static s64 bench_spinlock_pair(u32 n)
+{
+	static DEFINE_SPINLOCK(dummy);
+	ktime_t t0 = ktime_get();
+	unsigned long flags;
+	u32 i;
+
+	for (i = 0; i < n; i++) {
+		spin_lock_irqsave(&dummy, flags);
+		spin_unlock_irqrestore(&dummy, flags);
+	}
+
+	return ktime_to_ns(ktime_sub(ktime_get(), t0));
+}
+
+static noinline void bench_noop(void)
+{
+}
+
+/* One call and return, nothing else - the unit cost of the call machinery. */
+static s64 bench_call_overhead(u32 n)
+{
+	ktime_t t0 = ktime_get();
+	u32 i;
+
+	for (i = 0; i < n; i++)
+		bench_noop();
+
+	return ktime_to_ns(ktime_sub(ktime_get(), t0));
+}
+
+/* One load from a 256-byte buffer that always stays hot in L1. */
+static s64 bench_cached_read(u32 n)
+{
+	static u32 buf[64] __cacheline_aligned;
+	ktime_t t0 = ktime_get();
+	u32 i, sink = 0;
+
+	buf[0] = 1;
+
+	for (i = 0; i < n; i++)
+		sink += READ_ONCE(buf[i & 63]);
+
+	if (sink == 0xdeadbeef)
+		pr_info("sun6i-hwlock-test: unreachable %u\n", sink);
+
+	return ktime_to_ns(ktime_sub(ktime_get(), t0));
+}
+
+static s64 bench_timeout_math(u32 n){
+	ktime_t t0 = ktime_get();
+	unsigned long acc = 0;
+	u32 i;
+
+	for (i = 0; i < n; i++)
+		acc += msecs_to_jiffies(1000) + jiffies;
+
+	if (acc == ULONG_MAX)
+		pr_info("sun6i-hwlock-test: %lu\n", acc);
+
+	return ktime_to_ns(ktime_sub(ktime_get(), t0));
+}
+
+/* Lock N of the sun6i bank lives at SPINLOCK_LOCK_REGN + 4 * N (0x100). */
+#define HWLOCK_LOCK_REGN	0x100
+
+static int run_bench(struct shared __iomem *sh, struct hwspinlock *lk, u32 n)
+{
+	unsigned long wait_ms = 0;
+	ktime_t t0;
+	s64 rd_ns, wr_ns, lk_ns, raw_ns = 0, rawapi_ns = 0;
+	s64 atomic_ns = 0, spin_ns = 0, time_ns = 0, mb_ns = 0, cpu_ns = 0;
+	s64 call_ns = 0, cread_ns = 0;
+	void __iomem *lock_base = NULL, *lock_reg = NULL;
+
+	/* magic set, go stays 0: the DSP polls but never takes the lock */
+	shared_reset(sh, n);
+
+	pr_info("sun6i-hwlock-test: bench %u, %u iterations, lock %u, DSP idle\n",
+		bench, n, lock_id);
+
+	/*
+	 * bench 3 repeats the take/free on the bare register, to separate the
+	 * cost of the bus from the cost of the framework around it.
+	 */
+	if (bench >= 3) {
+		struct device_node *np;
+
+		np = of_find_compatible_node(NULL, NULL,
+					     "allwinner,sun20i-d1-hwspinlock");
+		if (np) {
+			lock_base = of_iomap(np, 0);
+			of_node_put(np);
+		}
+		if (lock_base)
+			lock_reg = lock_base + HWLOCK_LOCK_REGN + 4 * lock_id;
+		else
+			pr_warn("sun6i-hwlock-test: no hwlock node, raw bench skipped\n");
+	}
+
+	rd_ns = bench_read(sh, n);
+	wr_ns = bench_write(sh, n);
+	if (lock_reg) {
+		raw_ns = bench_raw_take_free(lock_reg, n);
+		rawapi_ns = bench_trylock_raw(lk, n);
+	}
+	if (bench >= 4) {
+		atomic_ns = bench_atomic_api(lk, n);
+		spin_ns = bench_spinlock_pair(n);
+		time_ns = bench_timeout_math(n);
+		cpu_ns = bench_cpu_speed(n);
+		call_ns = bench_call_overhead(n);
+		cread_ns = bench_cached_read(n);
+		if (lock_reg)
+			mb_ns = bench_raw_take_free_mb(lock_reg, n);
+	}
+	lk_ns = bench_take_free(lk, n);
+	if (lk_ns < 0) {
+		pr_err("sun6i-hwlock-test: take/free failed: %lld\n", lk_ns);
+		if (lock_base)
+			iounmap(lock_base);
+		return (int)lk_ns;
+	}
+
+	pr_info("sun6i-hwlock-test:   uncached read  %8lld ns/iter\n",
+		rd_ns / max_t(u32, n, 1));
+	pr_info("sun6i-hwlock-test:   uncached write %8lld ns/iter\n",
+		wr_ns / max_t(u32, n, 1));
+	if (lock_reg) {
+		pr_info("sun6i-hwlock-test:   lock reg r+w   %8lld ns/iter\n",
+			raw_ns / max_t(u32, n, 1));
+		pr_info("sun6i-hwlock-test:   trylock_raw    %8lld ns/iter\n",
+			rawapi_ns / max_t(u32, n, 1));
+	}
+	if (bench >= 4) {
+		if (lock_reg)
+			pr_info("sun6i-hwlock-test:   reg + 2 mb     %8lld ns/iter\n",
+				mb_ns / max_t(u32, n, 1));
+		pr_info("sun6i-hwlock-test:   atomic api     %8lld ns/iter\n",
+			atomic_ns / max_t(u32, n, 1));
+		pr_info("sun6i-hwlock-test:   spinlock pair  %8lld ns/iter\n",
+			spin_ns / max_t(u32, n, 1));
+		pr_info("sun6i-hwlock-test:   jiffies+msecs  %8lld ns/iter\n",
+			time_ns / max_t(u32, n, 1));
+		pr_info("sun6i-hwlock-test:   cpu, 8 adds    %8lld ns/iter (~%lld MHz)\n",
+			cpu_ns / max_t(u32, n, 1),
+			8000 / max_t(s64, cpu_ns / max_t(u32, n, 1), 1));
+		pr_info("sun6i-hwlock-test:   noop call      %8lld ns/iter\n",
+			call_ns / max_t(u32, n, 1));
+		pr_info("sun6i-hwlock-test:   cached read    %8lld ns/iter\n",
+			cread_ns / max_t(u32, n, 1));
+	}
+	pr_info("sun6i-hwlock-test:   take + free    %8lld ns/iter\n",
+		lk_ns / max_t(u32, n, 1));
+
+	if (lock_base)
+		iounmap(lock_base);
+
+	if (bench < 2 || skip_dsp)
+		return 0;
+
+	/*
+	 * Ask the DSP for its own take/free cost. It is timed from here in wall
+	 * clock, because its cycle counter runs at a tick rate we cannot map to
+	 * nanoseconds. One poll delay (~10 ms) is included, which is noise for
+	 * the iteration counts used here.
+	 */
+	writel(0, &sh->dsp_bench_done);
+	writel(1, &sh->dsp_bench_req);
+
+	t0 = ktime_get();
+	while (!readl(&sh->dsp_bench_done)) {
+		if (wait_ms > dsp_timeout_ms) {
+			pr_err("sun6i-hwlock-test: DSP bench not done after %u ms\n",
+			       dsp_timeout_ms);
+			pr_err("sun6i-hwlock-test: dsp_ping %u - firmware older than FW_REV 5?\n",
+			       readl(&sh->dsp_ping));
+			return -ETIMEDOUT;
+		}
+		msleep(20);
+		wait_ms += 20;
+	}
+
+	pr_info("sun6i-hwlock-test:   DSP take+free  %8lld ns/iter (wall clock)\n",
+		ktime_to_ns(ktime_sub(ktime_get(), t0)) / max_t(u32, n, 1));
+
+	return 0;
+}
+
 static int __init hwlock_test_init(void)
 {
 	struct shared __iomem *sh;
@@ -154,7 +518,7 @@ static int __init hwlock_test_init(void)
 	pr_info("sun6i-hwlock-test: shared=%#lx trials=%u lock=%u use_lock=%d skip_dsp=%d\n",
 		shared_phys, trials, lock_id, use_lock, skip_dsp);
 
-	if (use_lock) {
+	if (use_lock || bench) {
 		lk = hwspin_lock_request_specific(lock_id);
 		if (!lk) {
 			pr_err("sun6i-hwlock-test: no hardware lock %u\n", lock_id);
@@ -175,6 +539,11 @@ static int __init hwlock_test_init(void)
 	pr_info("sun6i-hwlock-test: dsp_ping %u -> %u: %s\n", ping1, ping2,
 		ping1 != ping2 ? "DSP alive, polling" :
 				 "DSP not polling (never started, or stuck/stopped)");
+
+	if (bench) {
+		ret = run_bench(sh, lk, trials);
+		goto out_put;
+	}
 
 	/* Arm the shared block and release the DSP; both sides start now. */
 	shared_reset(sh, trials);
