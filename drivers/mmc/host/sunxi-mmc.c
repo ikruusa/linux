@@ -392,6 +392,19 @@ static void sunxi_mmc_init_idma_des(struct sunxi_mmc_host *host,
 	 * descriptors hit the main-mem.
 	 */
 	wmb();
+
+	/*
+	 * dma_alloc_coherent() memory is only guaranteed to be coherent while
+	 * it is being handed out: on hosts that cannot map it uncached (e.g.
+	 * RISC-V without Svpbmt, where the I/O and non-cacheable PTE bits
+	 * compile away) it stays ordinary cacheable write-back memory. The
+	 * descriptor stores above can therefore still be sitting dirty in the
+	 * cache when the IDMAC fetches the chain, in which case the engine
+	 * sees stale descriptors, never transfers the data and never raises
+	 * its completion interrupt - the request then hangs forever.
+	 */
+	dma_sync_single_for_device(mmc_dev(host->mmc), host->sg_dma,
+				   PAGE_SIZE, DMA_TO_DEVICE);
 }
 
 static int sunxi_mmc_map_dma(struct sunxi_mmc_host *host,
