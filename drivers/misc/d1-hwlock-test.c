@@ -586,8 +586,9 @@ static int __init hwlock_test_init(void)
 		pr_warn("sun6i-hwlock-test: no hwlock device, cannot maintain the shared line - results mean nothing with the D-cache on\n");
 	}
 
-	pr_info("sun6i-hwlock-test: shared=%#lx trials=%u lock=%u use_lock=%d skip_dsp=%d\n",
-		shared_phys, trials, lock_id, use_lock, skip_dsp);
+	pr_info("sun6i-hwlock-test: shared=%#lx trials=%u lock=%u use_lock=%d skip_dsp=%d sync=%s\n",
+		shared_phys, trials, lock_id, use_lock, skip_dsp,
+		sh_dev ? "yes" : "NO");
 
 	if (use_lock || bench) {
 		lk = hwspin_lock_request_specific(lock_id);
@@ -604,6 +605,7 @@ static int __init hwlock_test_init(void)
 	 * which separates "never saw magic" from "printing 'go' then died".
 	 * Sampled before shared_reset() so a previous run does not confuse it.
 	 */
+	sh_sync_in();
 	ping1 = readl(&sh->dsp_ping);
 	msleep(100);
 	sh_sync_in();
@@ -655,11 +657,20 @@ static int __init hwlock_test_init(void)
 		}
 	}
 
+	/*
+	 * Let the peer's last stores settle before reading its results. Reading
+	 * the block the instant dsp_done becomes visible can return a mixed
+	 * snapshot - the final counter next to a checkpoint-old dsp_iters,
+	 * which is what this test reported once before the settle was added.
+	 */
+	msleep(50);
+
 	sh_sync_in();
 	counter = readl(&sh->counter);
 	dsp_iters = readl(&sh->dsp_iters);
 	dsp_done = readl(&sh->dsp_done);
 	dsp_trips = readl(&sh->dsp_violations);
+
 	expected = trials + dsp_iters;
 
 	/*
