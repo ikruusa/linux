@@ -658,10 +658,15 @@ static int __init hwlock_test_init(void)
 	}
 
 	/*
-	 * Let the peer's last stores settle before reading its results. Reading
-	 * the block the instant dsp_done becomes visible can return a mixed
-	 * snapshot - the final counter next to a checkpoint-old dsp_iters,
-	 * which is what this test reported once before the settle was added.
+	 * Let the peer's last stores settle before sampling its results: cheap
+	 * insurance against reading the block while its final write-back is
+	 * still in flight.
+	 *
+	 * The FAIL that first looked like such a race was not one. The DSP's own
+	 * read-back agreed with the shared field, and the counter was exactly one
+	 * above linux_iters + dsp_iters: the firmware stored its loop variable
+	 * instead of the number of completed iterations, so it under-reported by
+	 * one whenever Linux stopped it early. Fixed in firmware rev 8.
 	 */
 	msleep(50);
 
