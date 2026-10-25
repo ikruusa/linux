@@ -9,12 +9,18 @@
  *
  * The shared block lives in DDR at 0x483ff000, inside the 4 MB reserved-memory
  * carveout that also holds the firmware image (which ends near 0x480f2890):
- *   - Linux reaches it via ioremap(), uncached, and the carveout keeps the page
- *     allocator away from it;
- *   - the DSP maps 0x40000000+ as CA_BYPASS in its _cache_config(), so it is
- *     uncached on that side too.
- * Neither side caches it, so a lost update is a real locking failure and not a
- * coherency artefact.
+ *   - the carveout keeps the page allocator away from it;
+ *   - ioremap() does NOT make it uncached on this SoC: without Svpbmt the PTE
+ *     carries no attribute, and with MXSTATUS.MAEE clear the M-mode sysmap is
+ *     what decides cacheability - and that map is not software-programmable.
+ *     The DSP's CA_BYPASS request for 0x40000000+ does not take effect either
+ *     (its own comment says so).
+ *
+ * So the block is cached on both sides and both sides maintain it explicitly:
+ * the firmware wraps each round in xthal_dcache_region_invalidate/writeback,
+ * this side in dma_sync_single_for_cpu/device() over the same 64-byte line.
+ * Without that, a "lost update" is a coherency artefact rather than a locking
+ * failure.
  *
  * The DSP's own local DRAM1 at 0x00440000 was tried first and does NOT work:
  * once DSP_BOOT_RAMMAP bit 0 is cleared the SRAM belongs to the DSP and the
@@ -22,6 +28,7 @@
  */
 
 #include <linux/delay.h>
+#include <linux/dma-mapping.h>
 #include <linux/hwspinlock.h>
 #include <linux/init.h>
 #include <linux/io.h>
@@ -32,6 +39,8 @@
 #include <linux/moduleparam.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
+#include <linux/of_platform.h>
+#include <linux/platform_device.h>
 #include <linux/spinlock.h>
 
 #define SHARED_PHYS_DEFAULT	0x483ff000UL
@@ -43,7 +52,8 @@
 
 /*
  * Layout is shared verbatim with the FreeRTOS image - keep the two in sync.
- * Every field is touched with readl()/writel() so nothing is cached.
+ * The whole struct is 56 bytes at a 4 KiB-aligned base, i.e. one 64-byte cache
+ * line, which is exactly the granularity the maintenance below works on.
  */
 struct shared {
 	u32 magic;
@@ -83,6 +93,36 @@ MODULE_PARM_DESC(use_lock, "1 = take the lock, 0 = negative control");
 MODULE_PARM_DESC(skip_dsp, "run without a DSP partner");
 MODULE_PARM_DESC(bench, "0 = contention test, 1 = C906 take/free cost, 2 = 1 + DSP take/free cost, 3 = 2 + bare register cost, 4 = 3 + framework split");
 
+/*
+ * Cross-core cache maintenance, the same thing the DSP firmware does with
+ * xthal_dcache_region_invalidate()/writeback(). The DMA API is the way to get
+ * at the C906's CMO instructions from a driver: dma-direct sees a
+ * non-coherent device (the soc node carries dma-noncoherent) and runs the
+ * T-Head th.dcache.cpa/civa ops. sh_dev is the hwspinlock platform device.
+ */
+#define SHARED_SYNC_BYTES	64
+
+static struct platform_device *sh_pdev;
+static struct device *sh_dev;
+
+/* Pull in what the peer wrote, before reading the block. */
+static inline void sh_sync_in(void)
+{
+	if (sh_dev)
+		dma_sync_single_for_cpu(sh_dev, shared_phys, SHARED_SYNC_BYTES,
+					DMA_FROM_DEVICE);
+	mb();
+}
+
+/* Make our writes visible, before releasing the lock. */
+static inline void sh_sync_out(void)
+{
+	mb();
+	if (sh_dev)
+		dma_sync_single_for_device(sh_dev, shared_phys, SHARED_SYNC_BYTES,
+					   DMA_TO_DEVICE);
+}
+
 static void shared_reset(struct shared __iomem *sh, u32 target)
 {
 	writel(0, &sh->magic);
@@ -99,6 +139,7 @@ static void shared_reset(struct shared __iomem *sh, u32 target)
 	writel(target, &sh->target);
 	writel(SHARED_VERSION, &sh->version);
 	writel(SHARED_MAGIC, &sh->magic);
+	sh_sync_out();
 }
 
 /*
@@ -122,6 +163,15 @@ static int run_burst(struct shared __iomem *sh, struct hwspinlock *lk, u32 n)
 		}
 
 		/*
+		 * The lock only guarantees exclusion. The shared line is cached on
+		 * both sides, so each master has to fetch the other's writes itself:
+		 * invalidate on entry, clean on the way out - and clean *before*
+		 * releasing the lock, or the peer could take it while our update is
+		 * still only in our cache.
+		 */
+		sh_sync_in();
+
+		/*
 		 * If the lock works, nobody else can be between the take and
 		 * the free, so this must always read 0.
 		 */
@@ -131,15 +181,18 @@ static int run_burst(struct shared __iomem *sh, struct hwspinlock *lk, u32 n)
 		writel(1, &sh->inside);
 
 		/*
-		 * Deliberately not atomic, with a gap. On uncached memory each
-		 * access crosses the bus, so even this plain sequence has a
-		 * wide window - which is what makes the negative control fail.
+		 * Deliberately not atomic, with a gap: the read, the re-read and
+		 * the store are separate bus accesses, so even this plain sequence
+		 * has a wide window - which is what makes the negative control
+		 * fail.
 		 */
 		cur = readl(&sh->counter);
 		cur = readl(&sh->counter) + 1;
 		writel(cur, &sh->counter);
 
 		writel(0, &sh->inside);
+
+		sh_sync_out();
 
 		if (use_lock)
 			hwspin_unlock(lk);
@@ -505,6 +558,7 @@ static int __init hwlock_test_init(void)
 {
 	struct shared __iomem *sh;
 	struct hwspinlock *lk = NULL;
+	struct device_node *np;
 	ktime_t t0, t1;
 	u32 dsp_iters, counter, expected, dsp_done, dsp_trips, ping1, ping2;
 	const char *verdict;
@@ -514,6 +568,23 @@ static int __init hwlock_test_init(void)
 	sh = ioremap(shared_phys, SHARED_SIZE);
 	if (!sh)
 		return -ENOMEM;
+
+	/*
+	 * A device from the soc node, only to reach the CMO instructions through
+	 * the DMA API. The node exists whether or not the hwspinlock driver is
+	 * bound, so this works for the use_lock=0 control as well.
+	 */
+	np = of_find_compatible_node(NULL, NULL,
+				     "allwinner,sun20i-d1-hwspinlock");
+	if (np) {
+		sh_pdev = of_find_device_by_node(np);
+		of_node_put(np);
+	}
+	if (sh_pdev) {
+		sh_dev = &sh_pdev->dev;
+	} else {
+		pr_warn("sun6i-hwlock-test: no hwlock device, cannot maintain the shared line - results mean nothing with the D-cache on\n");
+	}
 
 	pr_info("sun6i-hwlock-test: shared=%#lx trials=%u lock=%u use_lock=%d skip_dsp=%d\n",
 		shared_phys, trials, lock_id, use_lock, skip_dsp);
@@ -535,6 +606,7 @@ static int __init hwlock_test_init(void)
 	 */
 	ping1 = readl(&sh->dsp_ping);
 	msleep(100);
+	sh_sync_in();
 	ping2 = readl(&sh->dsp_ping);
 	pr_info("sun6i-hwlock-test: dsp_ping %u -> %u: %s\n", ping1, ping2,
 		ping1 != ping2 ? "DSP alive, polling" :
@@ -547,8 +619,10 @@ static int __init hwlock_test_init(void)
 
 	/* Arm the shared block and release the DSP; both sides start now. */
 	shared_reset(sh, trials);
-	if (!skip_dsp)
+	if (!skip_dsp) {
 		writel(1, &sh->go);
+		sh_sync_out();
+	}
 
 	t0 = ktime_get();
 	ret = run_burst(sh, lk, trials);
@@ -560,10 +634,14 @@ static int __init hwlock_test_init(void)
 	trips = ret;
 
 	writel(1, &sh->stop);
+	sh_sync_out();
 
 	/* Wait for the DSP to finish its own burst, if there is one */
 	if (!skip_dsp) {
-		while (!readl(&sh->dsp_done)) {
+		for (;;) {
+			sh_sync_in();
+			if (readl(&sh->dsp_done))
+				break;
 			if (wait_ms > dsp_timeout_ms) {
 				pr_err("sun6i-hwlock-test: DSP not done after %u ms\n",
 				       dsp_timeout_ms);
@@ -577,6 +655,7 @@ static int __init hwlock_test_init(void)
 		}
 	}
 
+	sh_sync_in();
 	counter = readl(&sh->counter);
 	dsp_iters = readl(&sh->dsp_iters);
 	dsp_done = readl(&sh->dsp_done);
@@ -623,6 +702,9 @@ out_put:
 	if (lk)
 		hwspin_lock_free(lk);
 out_unmap:
+	if (sh_pdev)
+		put_device(&sh_pdev->dev);
+	sh_dev = NULL;
 	iounmap(sh);
 	return ret;
 }
