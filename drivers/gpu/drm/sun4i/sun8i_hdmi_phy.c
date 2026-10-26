@@ -747,6 +747,15 @@ void sun8i_hdmi_phy_set_ops(struct sun8i_hdmi_phy *phy,
 	const struct sun8i_hdmi_phy_variant *variant = phy->variant;
 
 	if (variant->phy_ops) {
+		/*
+		 * The controller reports a Synopsys PHY type in HDMI_CONFIG2_ID
+		 * on some SoCs (the D1 does), and dw-hdmi only consults the
+		 * glue layer's phy_ops when the PHY is known to be a vendor
+		 * one. Without this, dw-hdmi falls back to its built-in
+		 * sequence and dereferences the mpll_cfg/cur_ctr/phy_config
+		 * tables, which a phy_ops variant does not provide.
+		 */
+		plat_data->phy_force_vendor = true;
 		plat_data->phy_ops = variant->phy_ops;
 		plat_data->phy_name = "sun8i_dw_hdmi_phy";
 		plat_data->phy_data = phy;
