@@ -60,6 +60,10 @@
 	};
 };
 
+&de {
+	status = "okay";
+};
+
 &dmic {
 	pinctrl-0 = <&dmic_pb11_d0_pin>, <&dmic_pe17_clk_pin>;
 	pinctrl-names = "default";
