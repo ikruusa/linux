@@ -47,6 +47,17 @@
 		compatible = "mmc-pwrseq-simple";
 		reset-gpios = <&pio 6 12 GPIO_ACTIVE_LOW>; /* PG12 */
 	};
+
+	hdmi_connector: connector {
+		compatible = "hdmi-connector";
+		type = "a";
+
+		port {
+			hdmi_connector_in: endpoint {
+				remote-endpoint = <&hdmi_out_connector>;
+			};
+		};
+	};
 };
 
 &dmic {
@@ -56,6 +67,21 @@
 };
 
 &ehci1 {
+	status = "okay";
+};
+
+&hdmi {
+	hvcc-supply = <&reg_ldoa>;
+	status = "okay";
+};
+
+&hdmi_out {
+	hdmi_out_connector: endpoint {
+		remote-endpoint = <&hdmi_connector_in>;
+	};
+};
+
+&hdmi_phy {
 	status = "okay";
 };
 
