@@ -16,11 +16,23 @@
  *     The DSP's CA_BYPASS request for 0x40000000+ does not take effect either
  *     (its own comment says so).
  *
- * So the block is cached on both sides and both sides maintain it explicitly:
- * the firmware wraps each round in xthal_dcache_region_invalidate/writeback,
- * this side in dma_sync_single_for_cpu/device() over the same 64-byte line.
- * Without that, a "lost update" is a coherency artefact rather than a locking
- * failure.
+ * So the block was cached on both sides, and both sides maintained it
+ * explicitly: the firmware wraps each round in xthal_dcache_region_invalidate/
+ * writeback, this side used dma_sync_single_for_cpu/device() over the same
+ * 64-byte line.
+ *
+ * That changed on 2026-10-27, when the SPL started setting MXSTATUS.MAEE: the
+ * MMU now reads the T-Head memory type out of PTE[63:59], the ERRATA_THEAD_MAE
+ * alternative puts the non-cacheable encoding there, and ioremap() hands out a
+ * genuinely uncached mapping. Measured with the module's bench mode, a load
+ * from a hot buffer went from 147 ns to 6 ns and a take/free from 8.3 us to
+ * 0.48 us.
+ *
+ * So this side no longer needs any cache maintenance: a build with the DMA sync
+ * brackets disabled still gave an exact counter with a clean tripwire, and the
+ * negative control still failed. Only the fences that order the handoff points
+ * remain. The DSP still caches the block - its CA_BYPASS request does not take
+ * effect - so the firmware keeps its own xthal_dcache_region_* calls.
  *
  * The DSP's own local DRAM1 at 0x00440000 was tried first and does NOT work:
  * once DSP_BOOT_RAMMAP bit 0 is cleared the SRAM belongs to the DSP and the
@@ -28,7 +40,6 @@
  */
 
 #include <linux/delay.h>
-#include <linux/dma-mapping.h>
 #include <linux/hwspinlock.h>
 #include <linux/init.h>
 #include <linux/io.h>
@@ -39,8 +50,6 @@
 #include <linux/moduleparam.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
-#include <linux/of_platform.h>
-#include <linux/platform_device.h>
 #include <linux/spinlock.h>
 
 #define SHARED_PHYS_DEFAULT	0x483ff000UL
@@ -53,7 +62,7 @@
 /*
  * Layout is shared verbatim with the FreeRTOS image - keep the two in sync.
  * The whole struct is 56 bytes at a 4 KiB-aligned base, i.e. one 64-byte cache
- * line, which is exactly the granularity the maintenance below works on.
+ * line, which is the granularity the firmware still maintains it at.
  */
 struct shared {
 	u32 magic;
@@ -94,33 +103,19 @@ MODULE_PARM_DESC(skip_dsp, "run without a DSP partner");
 MODULE_PARM_DESC(bench, "0 = contention test, 1 = C906 take/free cost, 2 = 1 + DSP take/free cost, 3 = 2 + bare register cost, 4 = 3 + framework split");
 
 /*
- * Cross-core cache maintenance, the same thing the DSP firmware does with
- * xthal_dcache_region_invalidate()/writeback(). The DMA API is the way to get
- * at the C906's CMO instructions from a driver: dma-direct sees a
- * non-coherent device (the soc node carries dma-noncoherent) and runs the
- * T-Head th.dcache.cpa/civa ops. sh_dev is the hwspinlock platform device.
+ * Ordering at the handoff points. The block is non-cacheable on this side (see
+ * the file comment), so there is no cache maintenance to do here; what is left
+ * is a barrier so neither the compiler nor the core moves accesses across the
+ * point where the other master takes over. The names are historical.
  */
-#define SHARED_SYNC_BYTES	64
-
-static struct platform_device *sh_pdev;
-static struct device *sh_dev;
-
-/* Pull in what the peer wrote, before reading the block. */
 static inline void sh_sync_in(void)
 {
-	if (sh_dev)
-		dma_sync_single_for_cpu(sh_dev, shared_phys, SHARED_SYNC_BYTES,
-					DMA_FROM_DEVICE);
 	mb();
 }
 
-/* Make our writes visible, before releasing the lock. */
 static inline void sh_sync_out(void)
 {
 	mb();
-	if (sh_dev)
-		dma_sync_single_for_device(sh_dev, shared_phys, SHARED_SYNC_BYTES,
-					   DMA_TO_DEVICE);
 }
 
 static void shared_reset(struct shared __iomem *sh, u32 target)
@@ -558,7 +553,6 @@ static int __init hwlock_test_init(void)
 {
 	struct shared __iomem *sh;
 	struct hwspinlock *lk = NULL;
-	struct device_node *np;
 	ktime_t t0, t1;
 	u32 dsp_iters, counter, expected, dsp_done, dsp_trips, ping1, ping2;
 	const char *verdict;
@@ -570,25 +564,12 @@ static int __init hwlock_test_init(void)
 		return -ENOMEM;
 
 	/*
-	 * A device from the soc node, only to reach the CMO instructions through
-	 * the DMA API. The node exists whether or not the hwspinlock driver is
-	 * bound, so this works for the use_lock=0 control as well.
+	 * The shared block needs no cache maintenance on this side: with
+	 * MXSTATUS.MAEE set, ioremap() maps it non-cacheable. See the file
+	 * comment for the measurements behind that.
 	 */
-	np = of_find_compatible_node(NULL, NULL,
-				     "allwinner,sun20i-d1-hwspinlock");
-	if (np) {
-		sh_pdev = of_find_device_by_node(np);
-		of_node_put(np);
-	}
-	if (sh_pdev) {
-		sh_dev = &sh_pdev->dev;
-	} else {
-		pr_warn("sun6i-hwlock-test: no hwlock device, cannot maintain the shared line - results mean nothing with the D-cache on\n");
-	}
-
-	pr_info("sun6i-hwlock-test: shared=%#lx trials=%u lock=%u use_lock=%d skip_dsp=%d sync=%s\n",
-		shared_phys, trials, lock_id, use_lock, skip_dsp,
-		sh_dev ? "yes" : "NO");
+	pr_info("sun6i-hwlock-test: shared=%#lx trials=%u lock=%u use_lock=%d skip_dsp=%d\n",
+		shared_phys, trials, lock_id, use_lock, skip_dsp);
 
 	if (use_lock || bench) {
 		lk = hwspin_lock_request_specific(lock_id);
@@ -718,9 +699,6 @@ out_put:
 	if (lk)
 		hwspin_lock_free(lk);
 out_unmap:
-	if (sh_pdev)
-		put_device(&sh_pdev->dev);
-	sh_dev = NULL;
 	iounmap(sh);
 	return ret;
 }
