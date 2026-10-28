@@ -582,6 +582,15 @@ config TC9564_PCI
 	  access to other SoC devices through PCI function BARs.  A PCI
 	  quirk causes the ranges property in the endpoint's devicetree
 	  node to be updated dynamically.
+config D1_HWLOCK_TEST
+	tristate "Allwinner D1 hwspinlock contention test (DSP partner)"
+	depends on HWSPINLOCK
+	help
+	  TEST SCAFFOLDING, not for submission. Exercises one sun6i hardware
+	  spinlock from Linux against a FreeRTOS image running on the D1's
+	  HiFi4 DSP, to validate the sun6i hwspinlock series on the D1.
+
+	  Say N unless you are testing that driver.
 
 source "drivers/misc/c2port/Kconfig"
 source "drivers/misc/eeprom/Kconfig"
